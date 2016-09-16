@@ -23,6 +23,8 @@ from kuryr_libnetwork import controllers
 def configure_app():
     config.init(sys.argv[1:])
     log.setup(config.CONF, 'kuryr')
+    #Check config file IPVlan option
+    controllers.ipvlan_check_switch()
     controllers.neutron_client()
     controllers.check_for_neutron_ext_support()
     controllers.check_for_neutron_ext_tag()
