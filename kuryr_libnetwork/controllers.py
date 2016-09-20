@@ -17,6 +17,14 @@ import jsonschema
 import netaddr
 import time
 
+import socket
+import fcntl
+import struct
+
+#for ip link creation
+from pyroute2 import IPRoute
+from pyroute2.netlink.rtnl.ifinfmsg import ifinfmsg
+
 from neutronclient.common import exceptions as n_exceptions
 from neutronclient.v2_0 import client
 from oslo_concurrency import processutils
@@ -36,6 +44,8 @@ from kuryr_libnetwork import utils
 
 LOG = log.getLogger(__name__)
 
+ipvlan = 1
+vmport = []
 
 MANDATORY_NEUTRON_EXTENSION = "subnet_allocation"
 TAG_NEUTRON_EXTENSION = "tag"
@@ -204,6 +214,103 @@ def _process_interface_address(port_dict, subnets_dict_by_id,
         response_interface['Address'] = assigned_address
     else:
         response_interface['AddressIPv6'] = assigned_address
+
+def ipvlan_check_switch():
+    #Check conf file for IPVlan Switch and then set global variable
+    
+    temp_ipvlan = cfg.CONF.ipvlan
+    global ipvlan
+    if temp_ipvlan == 'true':
+       ipvlan = 1
+    else:
+       ipvlan = 0
+
+def _ipvlan_update_port(fixed_ips):
+    #Update VM Neutron Port with IP Address of container
+    
+    #Set ifname in kuryr.conf
+    #TODO: Auto discover ifname
+    ifname = cfg.CONF.ifname
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ip = socket.inet_ntoa(fcntl.ioctl(
+                   s.fileno(),
+                   0x8915,  
+                   struct.pack('256s', ifname[:15])
+                   )[20:24])
+    except:
+        app.logger.error(_LE("Error happened when getting host ip"))
+        raise
+   
+    ips = []
+    fip = [('ip_address=%s' % str(ip))]
+    ips.extend(fip)
+
+    try:
+        tport = app.neutron.list_ports(fixed_ips=ips)
+    except n_exceptions.NeutronClientException as ex:
+        app.logger.error(_LE("Error happened retrieving port list  %s"), ex)
+        raise
+        
+    vmport = tport['ports'][0]
+    global g_vmport
+    g_vmport = vmport
+    try:
+        port_details = app.neutron.show_port(vmport['id'])
+    except n_exceptions.NeutronClientException as ex:
+            app.logger.error(_LE("Error happened retrieving port information  %s"), ex)
+            raise
+    address_pairs = port_details['port']['allowed_address_pairs']
+
+    ip_list = []
+    for x in range(len(address_pairs)):
+            ip = {'ip_address': address_pairs[x]['ip_address']}
+            ip_list.append(ip)
+    ip = {'ip_address': fixed_ips}
+    ip_list.append(ip)
+
+    try:
+        response_port = app.neutron.update_port(
+            vmport['id'],
+            {'port': { 
+                     'allowed_address_pairs': ip_list
+                     }})
+    except n_exceptions.NeutronClientException as ex:
+        app.logger.error(_LE("Error happened during updating a "
+                        "Neutron port: %s"), ex)
+        raise
+
+    return response_port['port']
+
+def _ipvlan_remove_ip(fixed_ips):
+    #Remove container IP from allowed-address-pairs of VM port when container exit
+
+    global g_vmport
+    vmport = g_vmport
+
+    try:
+        port_details = app.neutron.show_port(vmport['id'])
+        address_pairs = port_details['port']['allowed_address_pairs']
+    except n_exceptions.NeutronClientException as ex:
+            app.logger.error(_LE("Error happened during updating a "
+                            "Neutron port: %s"), ex)
+            raise
+
+    ip_list = []
+    for x in range(len(address_pairs)):
+             if fixed_ips != address_pairs[x]['ip_address']:
+                ip = {'ip_address': address_pairs[x]['ip_address']}
+                ip_list.append(ip)
+    try:
+             response_port = app.neutron.update_port(
+                     vmport['id'],
+                     {'port': {
+                             'allowed_address_pairs': ip_list
+                             }})
+    except n_exceptions.NeutronClientException as ex:
+         app.logger.error(_LE("Error happened during updating a "
+                         "Neutron port: %s"), ex)
+         raise
 
 
 def _create_port(endpoint_id, neutron_network_id, interface_mac, fixed_ips):
@@ -579,110 +686,112 @@ def network_driver_create_network():
 
       https://github.com/docker/libnetwork/blob/master/docs/remote.md#create-network  # noqa
     """
-    json_data = flask.request.get_json(force=True)
-    app.logger.debug("Received JSON data %s for"
-                     " /NetworkDriver.CreateNetwork", json_data)
-    jsonschema.validate(json_data, schemata.NETWORK_CREATE_SCHEMA)
-    container_net_id = json_data['NetworkID']
-    neutron_network_name = utils.make_net_name(container_net_id, tags=app.tag)
-    pool_cidr = json_data['IPv4Data'][0]['Pool']
-    gateway_ip = ''
-    if 'Gateway' in json_data['IPv4Data'][0]:
-        gateway_cidr = json_data['IPv4Data'][0]['Gateway']
-        gateway_ip = gateway_cidr.split('/')[0]
-        app.logger.debug("gateway_cidr %(gateway_cidr)s, "
-            "gateway_ip %(gateway_ip)s",
-            {'gateway_cidr': gateway_cidr, 'gateway_ip': gateway_ip})
+    if ipvlan == 0:
+        json_data = flask.request.get_json(force=True)
+        app.logger.debug("Received JSON data %s for"
+                        " /NetworkDriver.CreateNetwork", json_data)
+        jsonschema.validate(json_data, schemata.NETWORK_CREATE_SCHEMA)
+        container_net_id = json_data['NetworkID']
+        neutron_network_name = utils.make_net_name(container_net_id, tags=app.tag)
+        pool_cidr = json_data['IPv4Data'][0]['Pool']
+        gateway_ip = ''
+        if 'Gateway' in json_data['IPv4Data'][0]:
+            gateway_cidr = json_data['IPv4Data'][0]['Gateway']
+            gateway_ip = gateway_cidr.split('/')[0]
+            app.logger.debug("gateway_cidr %(gateway_cidr)s, "
+                "gateway_ip %(gateway_ip)s",
+                {'gateway_cidr': gateway_cidr, 'gateway_ip': gateway_ip})
 
-    neutron_uuid = None
-    neutron_name = None
-    pool_name = ''
-    pool_id = ''
-    options = json_data.get('Options')
-    if options:
-        generic_options = options.get(const.NETWORK_GENERIC_OPTIONS)
-        if generic_options:
-            neutron_uuid = generic_options.get(const.NEUTRON_UUID_OPTION)
-            neutron_name = generic_options.get(const.NEUTRON_NAME_OPTION)
-            pool_name = generic_options.get(const.NEUTRON_POOL_NAME_OPTION)
+        neutron_uuid = None
+        neutron_name = None
+        pool_name = ''
+        pool_id = ''
+        options = json_data.get('Options')
+        if options:
+            generic_options = options.get(const.NETWORK_GENERIC_OPTIONS)
+            if generic_options:
+                neutron_uuid = generic_options.get(const.NEUTRON_UUID_OPTION)
+                neutron_name = generic_options.get(const.NEUTRON_NAME_OPTION)
+                pool_name = generic_options.get(const.NEUTRON_POOL_NAME_OPTION)
 
-    if pool_name:
-        pools = _get_subnetpools_by_attrs(name=pool_name)
-        if pools:
-            pool_id = pools[0]['id']
-        else:
-            raise exceptions.KuryrException(
-                  ("Specified pool name({0}) does not "
-                   "exist.").format(pool_name))
-
-    if not neutron_uuid and not neutron_name:
-        network = app.neutron.create_network(
-            {'network': {'name': neutron_network_name,
-                         "admin_state_up": True}})
-        network_id = network['network']['id']
-        _neutron_net_add_tags(network['network']['id'], container_net_id,
-                              tags=app.tag)
-
-        app.logger.info(_LI("Created a new network with name "
-            "%(neutron_network_name)s successfully: %(network)s"),
-            {'neutron_network_name': neutron_network_name, 'network': network})
-    else:
-        try:
-            if neutron_uuid:
-                networks = _get_networks_by_attrs(id=neutron_uuid)
-                specified_network = neutron_uuid
+        if pool_name:
+            pools = _get_subnetpools_by_attrs(name=pool_name)
+            if pools:
+                pool_id = pools[0]['id']
             else:
-                networks = _get_networks_by_attrs(name=neutron_name)
-                specified_network = neutron_name
-            if not networks:
                 raise exceptions.KuryrException(
-                      ("Specified network id/name({0}) does not "
-                       "exist.").format(specified_network))
-            network_id = networks[0]['id']
-        except n_exceptions.NeutronClientException as ex:
-            app.logger.error(_LE("Error happened during listing "
-                                 "Neutron networks: %s"), ex)
-            raise
-        if app.tag:
-            _neutron_net_add_tags(network_id, container_net_id, tags=app.tag)
-            _neutron_net_add_tag(network_id, const.KURYR_EXISTING_NEUTRON_NET)
-        else:
-            network = app.neutron.update_network(
-                neutron_uuid, {'network': {'name': neutron_network_name}})
-            app.logger.info(_LI("Updated the network with new name "
+                      ("Specified pool name({0}) does not "
+                        "exist.").format(pool_name))
+
+        if not neutron_uuid and not neutron_name:
+            network = app.neutron.create_network(
+                {'network': {'name': neutron_network_name,
+                             "admin_state_up": True}})
+            network_id = network['network']['id']
+            _neutron_net_add_tags(network['network']['id'], container_net_id,
+                                  tags=app.tag)
+
+            app.logger.info(_LI("Created a new network with name "
                 "%(neutron_network_name)s successfully: %(network)s"),
-                {'neutron_network_name': neutron_network_name,
-                 'network': network})
-        app.logger.info(_LI("Using existing network %s "
-                            "successfully"), neutron_uuid)
+                {'neutron_network_name': neutron_network_name, 'network': network})
+        else:
+            try:
+                if neutron_uuid:
+                    networks = _get_networks_by_attrs(id=neutron_uuid)
+                    specified_network = neutron_uuid
+                else:
+                    networks = _get_networks_by_attrs(name=neutron_name)
+                    specified_network = neutron_name
+                if not networks:
+                    raise exceptions.KuryrException(
+                          ("Specified network id/name({0}) does not "
+                            "exist.").format(specified_network))
+                network_id = networks[0]['id']
+            except n_exceptions.NeutronClientException as ex:
+                app.logger.error(_LE("Error happened during listing "
+                                     "Neutron networks: %s"), ex)
+                raise
+            if app.tag:
+                _neutron_net_add_tags(network_id, container_net_id, tags=app.tag)
+                _neutron_net_add_tag(network_id, const.KURYR_EXISTING_NEUTRON_NET)
+            else:
+                network = app.neutron.update_network(
+                    neutron_uuid, {'network': {'name': neutron_network_name}})
+                app.logger.info(_LI("Updated the network with new name "
+                    "%(neutron_network_name)s successfully: %(network)s"),
+                    {'neutron_network_name': neutron_network_name,
+                    'network': network})
+            app.logger.info(_LI("Using existing network %s "
+                                "successfully"), neutron_uuid)
 
-    cidr = netaddr.IPNetwork(pool_cidr)
-    subnet_network = str(cidr.network)
-    subnet_cidr = '/'.join([subnet_network, str(cidr.prefixlen)])
-    subnets = _get_subnets_by_attrs(
-        network_id=network_id, cidr=subnet_cidr)
-    if len(subnets) > 1:
-        raise exceptions.DuplicatedResourceException(
-            "Multiple Neutron subnets exist for the network_id={0}"
-            "and cidr={1}".format(network_id, cidr))
+        cidr = netaddr.IPNetwork(pool_cidr)
+        subnet_network = str(cidr.network)
+        subnet_cidr = '/'.join([subnet_network, str(cidr.prefixlen)])
+        subnets = _get_subnets_by_attrs(
+            network_id=network_id, cidr=subnet_cidr)
+        if len(subnets) > 1:
+            raise exceptions.DuplicatedResourceException(
+                "Multiple Neutron subnets exist for the network_id={0}"
+                "and cidr={1}".format(network_id, cidr))
 
-    if not subnets:
-        new_subnets = [{
-            'name': pool_cidr,
-            'network_id': network_id,
-            'ip_version': cidr.version,
-            'cidr': subnet_cidr,
-            'enable_dhcp': app.enable_dhcp,
-        }]
-        if pool_id:
-            new_subnets[0]['subnetpool_id'] = pool_id
-        if gateway_ip:
-            new_subnets[0]['gateway_ip'] = gateway_ip
+        if not subnets:
+            new_subnets = [{
+                'name': pool_cidr,
+                'network_id': network_id,
+                'ip_version': cidr.version,
+                'cidr': subnet_cidr,
+                'enable_dhcp': app.enable_dhcp,
+            }]
+            if pool_id:
+                new_subnets[0]['subnetpool_id'] = pool_id
+            if gateway_ip:
+                new_subnets[0]['gateway_ip'] = gateway_ip
 
-        app.neutron.create_subnet({'subnets': new_subnets})
+            app.neutron.create_subnet({'subnets': new_subnets})
 
-    return flask.jsonify(const.SCHEMA['SUCCESS'])
-
+        return flask.jsonify(const.SCHEMA['SUCCESS'])
+    else:
+        return flask.jsonify(const.SCHEMA['SUCCESS'])
 
 @app.route('/NetworkDriver.DeleteNetwork', methods=['POST'])
 def network_driver_delete_network():
@@ -703,10 +812,10 @@ def network_driver_delete_network():
     app.logger.debug("Received JSON data %s for"
                      " /NetworkDriver.DeleteNetwork", json_data)
     jsonschema.validate(json_data, schemata.NETWORK_DELETE_SCHEMA)
-
+    
     container_net_id = json_data['NetworkID']
     neutron_network_identifier = _make_net_identifier(container_net_id,
-                                                      tags=app.tag)
+                                                          tags=app.tag)
     if app.tag:
         existing_network_identifier = neutron_network_identifier + ','
         existing_network_identifier += const.KURYR_EXISTING_NEUTRON_NET
@@ -715,20 +824,20 @@ def network_driver_delete_network():
                 existing_network_identifier)
         except n_exceptions.NeutronClientException as ex:
             app.logger.error(_LE("Error happened during listing "
-                                 "Neutron networks: %s"), ex)
+                                    "Neutron networks: %s"), ex)
             raise
 
         if existing_networks:
             app.logger.warning(_LW("Network is a pre existing Neutron "
-                                   "network, not deleting in Neutron. "
-                                   "removing tags: %s"),
-                               existing_network_identifier)
+                                    "network, not deleting in Neutron. "
+                                    "removing tags: %s"),
+                                existing_network_identifier)
             neutron_net_id = existing_networks[0]['id']
             _neutron_net_remove_tags(neutron_net_id, container_net_id)
             _neutron_net_remove_tag(neutron_net_id,
-                                    const.KURYR_EXISTING_NEUTRON_NET)
-            return flask.jsonify(const.SCHEMA['SUCCESS'])
-
+                                     const.KURYR_EXISTING_NEUTRON_NET)
+    return flask.jsonify(const.SCHEMA['SUCCESS'])
+         
     try:
         filtered_networks = _get_networks_by_identifier(
             neutron_network_identifier)
@@ -823,32 +932,43 @@ def network_driver_create_endpoint():
     app.logger.debug("Received JSON data %s for "
                      "/NetworkDriver.CreateEndpoint", json_data)
     jsonschema.validate(json_data, schemata.ENDPOINT_CREATE_SCHEMA)
+    
+    if ipvlan == 0:
+        neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
+                                                          tags=app.tag)
+        endpoint_id = json_data['EndpointID']
+        filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
 
-    neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
-                                                      tags=app.tag)
-    endpoint_id = json_data['EndpointID']
-    filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
+        if not filtered_networks:
+            return flask.jsonify({
+                'Err': "Neutron net associated with identifier {0} doesn't exist."
+                .format(neutron_network_identifier)
+            })
+        else:
+            neutron_network_id = filtered_networks[0]['id']
+            interface = json_data['Interface'] or {}  # Workaround for null
+            interface_cidrv4 = interface.get('Address', '')
+            interface_cidrv6 = interface.get('AddressIPv6', '')
+            interface_mac = interface.get('MacAddress', '')
+            if not interface_cidrv4 and not interface_cidrv6:
+                return flask.jsonify({
+                    'Err': "Interface address v4 or v6 not provided."
+                })
+            response_interface = _create_or_update_port(
+                neutron_network_id, endpoint_id, interface_cidrv4,
+                interface_cidrv6, interface_mac)
 
-    if not filtered_networks:
-        return flask.jsonify({
-            'Err': "Neutron net associated with identifier {0} doesn't exist."
-            .format(neutron_network_identifier)
-        })
+            return flask.jsonify({'Interface': response_interface})
+    
     else:
-        neutron_network_id = filtered_networks[0]['id']
+        #Take the IP address given by Docker and pass it to the IPVlan function
         interface = json_data['Interface'] or {}  # Workaround for null
         interface_cidrv4 = interface.get('Address', '')
-        interface_cidrv6 = interface.get('AddressIPv6', '')
-        interface_mac = interface.get('MacAddress', '')
-        if not interface_cidrv4 and not interface_cidrv6:
-            return flask.jsonify({
-                'Err': "Interface address v4 or v6 not provided."
-            })
-        response_interface = _create_or_update_port(
-            neutron_network_id, endpoint_id, interface_cidrv4,
-            interface_cidrv6, interface_mac)
+        container_ip_address = interface_cidrv4.rsplit('/', 1)[0]
 
-        return flask.jsonify({'Interface': response_interface})
+        response_port = _ipvlan_update_port(container_ip_address)
+
+        return flask.jsonify(const.SCHEMA['SUCCESS'])
 
 
 @app.route('/NetworkDriver.EndpointOperInfo', methods=['POST'])
@@ -918,88 +1038,107 @@ def network_driver_join():
 
       https://github.com/docker/libnetwork/blob/master/docs/remote.md#join  # noqa
     """
-    json_data = flask.request.get_json(force=True)
-    app.logger.debug("Received JSON data %s for /NetworkDriver.Join",
-                     json_data)
-    jsonschema.validate(json_data, schemata.JOIN_SCHEMA)
+    if ipvlan == 0:
+        json_data = flask.request.get_json(force=True)
+        app.logger.debug("Received JSON data %s for /NetworkDriver.Join",
+                         json_data)
+        jsonschema.validate(json_data, schemata.JOIN_SCHEMA)
 
-    neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
-                                                      tags=app.tag)
-    endpoint_id = json_data['EndpointID']
-    filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
+        neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
+                                                          tags=app.tag)
+        endpoint_id = json_data['EndpointID']
+        filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
 
-    if not filtered_networks:
-        return flask.jsonify({
-            'Err': "Neutron net associated with identifier {0} doesn't exit."
-            .format(neutron_network_identifier)
-        })
-    else:
-        neutron_network_id = filtered_networks[0]['id']
+        if not filtered_networks:
+            return flask.jsonify({
+                'Err': "Neutron net associated with identifier {0} doesn't exit."
+                .format(neutron_network_identifier)
+            })
+        else:
+            neutron_network_id = filtered_networks[0]['id']
 
-        neutron_port_name = utils.get_neutron_port_name(endpoint_id)
-        filtered_ports = _get_ports_by_attrs(name=neutron_port_name)
-        if not filtered_ports:
-            raise exceptions.NoResourceException(
-                "The port doesn't exist for the name {0}"
-                .format(neutron_port_name))
-        neutron_port = filtered_ports[0]
-        all_subnets = _get_subnets_by_attrs(network_id=neutron_network_id)
-        if len(all_subnets) > 2:  # subnets for IPv4 and/or IPv6
-            raise exceptions.DuplicatedResourceException(
-                "Multiple Neutron subnets exist for the network_id={0} "
-                .format(neutron_network_id))
-
-        try:
-            ifname, peer_name, (stdout, stderr) = binding.port_bind(
-                endpoint_id, neutron_port, all_subnets, filtered_networks[0])
-            app.logger.debug(stdout)
-            if stderr:
-                app.logger.error(stderr)
-        except exceptions.VethCreationFailure as ex:
-            with excutils.save_and_reraise_exception():
-                app.logger.error(_LE('Preparing the veth '
-                                     'pair was failed: %s.'), ex)
-        except processutils.ProcessExecutionError:
-            with excutils.save_and_reraise_exception():
-                app.logger.error(_LE(
-                    'Could not bind the Neutron port to the veth endpoint.'))
-
-        if app.vif_plug_is_fatal:
-            port_active = _port_active(neutron_port['id'],
-                                       app.vif_plug_timeout)
-            if not port_active:
-                raise exceptions.InactiveResourceException(
-                    "Neutron port {0} did not become active on time."
+            neutron_port_name = utils.get_neutron_port_name(endpoint_id)
+            filtered_ports = _get_ports_by_attrs(name=neutron_port_name)
+            if not filtered_ports:
+                raise exceptions.NoResourceException(
+                    "The port doesn't exist for the name {0}"
                     .format(neutron_port_name))
+            neutron_port = filtered_ports[0]
+            all_subnets = _get_subnets_by_attrs(network_id=neutron_network_id)
+            if len(all_subnets) > 2:  # subnets for IPv4 and/or IPv6
+                raise exceptions.DuplicatedResourceException(
+                    "Multiple Neutron subnets exist for the network_id={0} "
+                    .format(neutron_network_id))
 
-        join_response = {
-            "InterfaceName": {
-                "SrcName": peer_name,
-                "DstPrefix": config.CONF.binding.veth_dst_prefix
-            },
-            "StaticRoutes": []
-        }
+            try:
+                ifname, peer_name, (stdout, stderr) = binding.port_bind(
+                    endpoint_id, neutron_port, all_subnets, filtered_networks[0])
+                app.logger.debug(stdout)
+                if stderr:
+                    app.logger.error(stderr)
+            except exceptions.VethCreationFailure as ex:
+                with excutils.save_and_reraise_exception():
+                    app.logger.error(_LE('Preparing the veth '
+                                         'pair was failed: %s.'), ex)
+            except processutils.ProcessExecutionError:
+                with excutils.save_and_reraise_exception():
+                    app.logger.error(_LE(
+                        'Could not bind the Neutron port to the veth endpoint.'))
 
-        for subnet in all_subnets:
-            if subnet['ip_version'] == 4:
-                join_response['Gateway'] = subnet.get('gateway_ip', '')
-            else:
-                join_response['GatewayIPv6'] = subnet.get('gateway_ip', '')
-            host_routes = subnet.get('host_routes', [])
+            if app.vif_plug_is_fatal:
+                port_active = _port_active(neutron_port['id'],
+                                           app.vif_plug_timeout)
+                if not port_active:
+                    raise exceptions.InactiveResourceException(
+                        "Neutron port {0} did not become active on time."
+                        .format(neutron_port_name))
 
-            for host_route in host_routes:
-                static_route = {
-                    'Destination': host_route['destination']
-                }
-                if host_route.get('nexthop', None):
-                    static_route['RouteType'] = const.ROUTE_TYPE['NEXTHOP']
-                    static_route['NextHop'] = host_route['nexthop']
+            join_response = {
+                "InterfaceName": {
+                    "SrcName": peer_name,
+                    "DstPrefix": config.CONF.binding.veth_dst_prefix
+                },
+                "StaticRoutes": []
+            }
+
+            for subnet in all_subnets:
+                if subnet['ip_version'] == 4:
+                    join_response['Gateway'] = subnet.get('gateway_ip', '')
                 else:
-                    static_route['RouteType'] = const.ROUTE_TYPE['CONNECTED']
-                join_response['StaticRoutes'].append(static_route)
+                    join_response['GatewayIPv6'] = subnet.get('gateway_ip', '')
+                host_routes = subnet.get('host_routes', [])
 
+                for host_route in host_routes:
+                    static_route = {
+                        'Destination': host_route['destination']
+                    }
+                    if host_route.get('nexthop', None):
+                        static_route['RouteType'] = const.ROUTE_TYPE['NEXTHOP']
+                        static_route['NextHop'] = host_route['nexthop']
+                    else:
+                        static_route['RouteType'] = const.ROUTE_TYPE['CONNECTED']
+                    join_response['StaticRoutes'].append(static_route)
+
+            return flask.jsonify(join_response)
+
+    else:
+        ip = IPRoute()
+        ipvlan_mode = ifinfmsg.ifinfo.ipvlan_data.modes['IPVLAN_MODE_L2']
+        #TODO: Auto discover ifname
+        conf_ifname = cfg.CONF.ifname
+
+        ip.link('add',
+            ifname='kuryr-ipvlan',
+            kind='ipvlan',
+            link=ip.link_lookup(ifname=conf_ifname)[0], mode=ipvlan_mode)
+
+        peer_name = 'kuryr-ipvlan'
+        join_response = {
+                "InterfaceName": {
+                    "SrcName": peer_name
+                },
+            }
         return flask.jsonify(join_response)
-
 
 @app.route('/NetworkDriver.Leave', methods=['POST'])
 def network_driver_leave():
@@ -1013,45 +1152,48 @@ def network_driver_leave():
             "EndpointID": string
         }
     """
-    json_data = flask.request.get_json(force=True)
-    app.logger.debug("Received JSON data %s for"
-                     " /NetworkDriver.DeleteEndpoint", json_data)
-    jsonschema.validate(json_data, schemata.LEAVE_SCHEMA)
+    if ipvlan == 0:
+        json_data = flask.request.get_json(force=True)
+        app.logger.debug("Received JSON data %s for"
+                         " /NetworkDriver.DeleteEndpoint", json_data)
+        jsonschema.validate(json_data, schemata.LEAVE_SCHEMA)
 
-    neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
-                                                      tags=app.tag)
-    endpoint_id = json_data['EndpointID']
-    filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
+        neutron_network_identifier = _make_net_identifier(json_data['NetworkID'],
+                                                          tags=app.tag)
+        endpoint_id = json_data['EndpointID']
+        filtered_networks = _get_networks_by_identifier(neutron_network_identifier)
 
-    if not filtered_networks:
-        return flask.jsonify({
-            'Err': "Neutron net associated with identifier {0} doesn't exit."
-            .format(neutron_network_identifier)
-        })
-    else:
-        neutron_port_name = utils.get_neutron_port_name(endpoint_id)
-        filtered_ports = _get_ports_by_attrs(name=neutron_port_name)
-        if not filtered_ports:
-            raise exceptions.NoResourceException(
-                "The port doesn't exist for the name {0}"
-                .format(neutron_port_name))
-        neutron_port = filtered_ports[0]
-        try:
-            stdout, stderr = binding.port_unbind(endpoint_id, neutron_port)
-            app.logger.debug(stdout)
-            if stderr:
-                app.logger.error(stderr)
-        except processutils.ProcessExecutionError:
-            with excutils.save_and_reraise_exception():
-                app.logger.error(_LE(
-                    'Could not unbind the Neutron port from the veth '
-                    'endpoint.'))
-        except exceptions.VethDeletionFailure:
-            with excutils.save_and_reraise_exception():
-                app.logger.error(_LE('Cleaning the veth pair up was failed.'))
+        if not filtered_networks:
+            return flask.jsonify({
+                'Err': "Neutron net associated with identifier {0} doesn't exit."
+                .format(neutron_network_identifier)
+            })
+        else:
+            neutron_port_name = utils.get_neutron_port_name(endpoint_id)
+            filtered_ports = _get_ports_by_attrs(name=neutron_port_name)
+            if not filtered_ports:
+                raise exceptions.NoResourceException(
+                    "The port doesn't exist for the name {0}"
+                    .format(neutron_port_name))
+            neutron_port = filtered_ports[0]
+            try:
+                stdout, stderr = binding.port_unbind(endpoint_id, neutron_port)
+                app.logger.debug(stdout)
+                if stderr:
+                    app.logger.error(stderr)
+            except processutils.ProcessExecutionError:
+                with excutils.save_and_reraise_exception():
+                    app.logger.error(_LE(
+                        'Could not unbind the Neutron port from the veth '
+                        'endpoint.'))
+            except exceptions.VethDeletionFailure:
+                with excutils.save_and_reraise_exception():
+                    app.logger.error(_LE('Cleaning the veth pair up was failed.'))
 
-    return flask.jsonify(const.SCHEMA['SUCCESS'])
+        return flask.jsonify(const.SCHEMA['SUCCESS'])
 
+    else:       
+        return flask.jsonify(const.SCHEMA['SUCCESS'])
 
 @app.route('/NetworkDriver.ProgramExternalConnectivity', methods=['POST'])
 def network_driver_program_external_connectivity():
@@ -1308,12 +1450,20 @@ def ipam_request_address():
             # allocating address for container port
             neutron_network_id = subnet['network_id']
             try:
-                port = {
-                    'name': 'kuryr-unbound-port',
-                    'admin_state_up': True,
-                    'network_id': neutron_network_id,
-                    'binding:host_id': lib_utils.get_hostname(),
-                }
+                if ipvlan == 1:
+                    port = {
+                        'name': 'IPVlan-Container',
+                        'admin_state_up': True,
+                        'network_id': neutron_network_id,
+                        'binding:host_id': lib_utils.get_hostname(),
+                    }
+                else:
+                    port = {
+                        'name': 'kuryr-unbound-port',
+                        'admin_state_up': True,
+                        'network_id': neutron_network_id,
+                        'binding:host_id': lib_utils.get_hostname(),
+                    }
                 fixed_ips = port['fixed_ips'] = []
                 fixed_ip = {'subnet_id': subnet['id']}
                 num_ports = 0
@@ -1432,6 +1582,11 @@ def ipam_release_address():
     pool_id = json_data['PoolID']
     rel_address = json_data['Address']
     pools = _get_subnetpools_by_attrs(id=pool_id)
+    #Remove kuryr-ipvlan link and remove container ip from allowed-address-pairs
+    if ipvlan == 1:
+        _ipvlan_remove_ip(rel_address)
+        ip = IPRoute()
+        ip.link('remove', ifname='kuryr-ipvlan')
     if pools:
         pool = pools[0]
         prefixes = pool['prefixes']

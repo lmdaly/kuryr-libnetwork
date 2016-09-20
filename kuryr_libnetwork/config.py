@@ -44,6 +44,13 @@ core_opts = [
     cfg.StrOpt('global_default_address_space',
                default='no_address_space',
                help=_('There is no address-space by default in neutron')),
+    
+    cfg.StrOpt('ipvlan',
+               default='false',
+               help=_('Switch to enable IPVlan mode')),
+    cfg.StrOpt('ifname',
+               default='ens3',
+               help=_('Interface for VM Host')),
 ]
 
 CONF = cfg.CONF
